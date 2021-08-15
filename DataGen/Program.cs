@@ -3,6 +3,7 @@ using System.CommandLine;
 using System.CommandLine.Invocation;
 using System.CommandLine.IO;
 using System.IO;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Bogus;
@@ -109,6 +110,8 @@ namespace DataGen
 
             Randomizer.Seed = new Random((int) DateTime.Now.Ticks);
 
+            var sb = new StringBuilder(Environment.SystemPageSize);
+
             var faker = new Faker("en_US");
 
             for (var i = 0UL; i < count; i++)
@@ -118,8 +121,13 @@ namespace DataGen
                     return;
                 }
 
-                await file.WriteLineAsync($"{faker.Random.UInt(lowerBound, upperBound)}. {faker.Lorem.Sentence((int?) minWords, (int?) (maxWords - minWords))}");
+                sb.AppendJoin(". ", faker.Random.UInt(lowerBound, upperBound),
+                    faker.Lorem.Sentence((int?) minWords, (int?) (maxWords - minWords)));
+
+                await file.WriteLineAsync(sb.ToString());
                 progress.Report(i);
+
+                sb.Clear();
             }
         }
     }
