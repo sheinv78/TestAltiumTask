@@ -2,6 +2,7 @@
 using System.CommandLine;
 using System.CommandLine.Invocation;
 using System.CommandLine.IO;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -24,7 +25,7 @@ namespace DataGen
                     description: "File to write data to."),
                 new Option<ulong>(
                     "--count",
-                    ()=>10000000UL,
+                    ()=>100000000UL,
                     "Number of the lines to write."),
                 new Option<uint>(
                     "--lowerBound",
@@ -104,6 +105,7 @@ namespace DataGen
         /// <param name="token">Cancellation token.</param>
         /// <param name="progress">Progresser to notify to.</param>
         /// <returns>Task.</returns>
+        [SuppressMessage("ReSharper.DPA", "DPA0002: Excessive memory allocations in SOH")]
         private static async Task GenerateFile(string fileName, ulong count, uint lowerBound, uint upperBound, int minWords, int maxWords, CancellationToken token, IProgress<ulong> progress)
         {
             await using var file = File.CreateText(fileName);
@@ -122,7 +124,7 @@ namespace DataGen
                 }
 
                 sb.AppendJoin(". ", faker.Random.UInt(lowerBound, upperBound),
-                    faker.Lorem.Sentence((int?) minWords, (int?) (maxWords - minWords)));
+                    faker.Lorem.Sentence(minWords, maxWords - minWords));
 
                 await file.WriteLineAsync(sb.ToString());
                 progress.Report(i);
