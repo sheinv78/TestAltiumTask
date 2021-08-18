@@ -26,7 +26,7 @@ namespace DataSorter
                     description: "File to sort to."),
                 new Option<ulong>(
                     "--chunk-size",
-                    () => 0x1000U,
+                    () => 0x100000U,
                     "Average chunk size in records"),
             };
 
@@ -47,14 +47,14 @@ namespace DataSorter
                         console.Error.WriteLine("Operation was cancelled");
                     });
 
-                    var progress = new Progress<ulong>(
-                        _ =>
+                    var progress = new Progress<string>(
+                        value =>
                         {
                             if ((watch.Elapsed - prevTime).TotalSeconds < 1) return;
 
                             prevTime = watch.Elapsed;
 
-                            UpdateStatus(console, prevTime);
+                            UpdateStatus(console, prevTime, value);
                         });
 
                     await SortFile(sourcefileName, destFileName, chunkSize, console, ctoken, progress);
@@ -70,17 +70,34 @@ namespace DataSorter
             return result;
         }
 
+        /// <summary>
+        ///     Sort file.
+        /// </summary>
+        /// <param name="sourcefileName">Source file name.</param>
+        /// <param name="destFileName">Destination file name.</param>
+        /// <param name="chunkSize">The size of single chunk.</param>
+        /// <param name="console">Console.</param>
+        /// <param name="ctoken">Cancellation tocken.</param>
+        /// <param name="progress">Progress to report to the user.</param>
+        /// <returns>Task.</returns>
         private static Task SortFile(string sourcefileName, string destFileName, ulong chunkSize,
             IStandardOut console,
             CancellationToken ctoken,
-            IProgress<ulong> progress)
+            IProgress<string> progress)
         {
             return Task.Run(() =>
             {
                 console.Out.WriteLine("Splitting...");
 
+                var sourceFileInfo = new FileInfo(sourcefileName);
+
+                // ReSharper disable once PossibleLossOfFraction
+                var countOfFiles = Math.Ceiling((decimal)(sourceFileInfo.Length / (long)chunkSize));
+
+                console.Out.WriteLine($"Estimated split into {countOfFiles} files");
+
                 // Step1: Split input file into chunks of size ChunkSize.
-                var fileNames = Split(sourcefileName, chunkSize);
+                var fileNames = Split(sourcefileName, chunkSize, progress);
 
                 var fileList = fileNames.ToList();
                 foreach (var fileName in fileList)
@@ -89,7 +106,7 @@ namespace DataSorter
                 }
 
                 // Step2: Merging chunks
-                KWayMerge(fileList, destFileName);
+                KWayMerge(fileList, destFileName, progress);
 
                 foreach (var fileName in fileList)
                 {
@@ -101,13 +118,22 @@ namespace DataSorter
             }, ctoken);
         }
 
-        private static IEnumerable<string> Split(string sourcefileName, ulong chunkSize)
+        /// <summary>
+        ///     Split source file into a set of sorted chunks.
+        /// </summary>
+        /// <param name="sourcefileName">The name of source file.</param>
+        /// <param name="chunkSize">The size of single file.</param>
+        /// <param name="progress"></param>
+        /// <returns>The list of file names containing presorted chunks.</returns>
+        private static IEnumerable<string> Split(string sourcefileName, ulong chunkSize, IProgress<string> progress)
         {
-            static string WriteSortedData(List<FileData> list)
+            static string WriteSortedData(List<FileData> list, IProgress<string> progress)
             {
                 list.Sort();
 
                 var fileName = Path.GetTempFileName();
+
+                progress.Report($"Start unloading the chunk into {fileName}");
 
                 using var fileWriter = File.CreateText(fileName);
 
@@ -115,6 +141,8 @@ namespace DataSorter
                 {
                     fileWriter.WriteLine(data.ToString());
                 }
+
+                progress.Report($"Unloading the chunk into {fileName} completed");
 
                 fileWriter.Close();
                 list.Clear();
@@ -142,20 +170,26 @@ namespace DataSorter
                 }
                 else
                 {
-                    var tempfileName = WriteSortedData(chunk);
+                    var tempfileName = WriteSortedData(chunk, progress);
                     tempFileNames.Add(tempfileName);
                 }
             }
 
             if (chunk.Count == 0) return tempFileNames;
 
-            var fileName = WriteSortedData(chunk);
+            var fileName = WriteSortedData(chunk, progress);
             tempFileNames.Add(fileName);
 
             return tempFileNames;
         }
 
-        private static void KWayMerge(IEnumerable<string> fileNames, string destFileName)
+        /// <summary>
+        ///     Perform K-way merge.
+        /// </summary>
+        /// <param name="fileNames">Source file names.</param>
+        /// <param name="destFileName">Destination file name.</param>
+        /// <param name="progress"></param>
+        private static void KWayMerge(IEnumerable<string> fileNames, string destFileName, IProgress<string> progress)
         {
             using var destWriter = File.CreateText(destFileName);
 
@@ -163,6 +197,8 @@ namespace DataSorter
 
             try
             {
+                progress.Report($"Initial fillup of minheap.");
+
                 streamReaders.AddRange(fileNames.Select(x=>(File.OpenText(x),x)));
 
                 var queue = new MinHeap<FileDataReaderItem>();
@@ -178,13 +214,19 @@ namespace DataSorter
                     queue.Insert(new FileDataReaderItem(fileData, reader, fileName));
                 }
 
+                progress.Report($"Start k-way merge.");
+
                 while (true)
                 {
                     if (queue.Count == 0) break;
 
                     var minItem = queue.ExtractMin();
 
-                    if (minItem == null) break;
+                    if (minItem == null)
+                    {
+                        progress.Report("Sucessfully completed.");
+                        break;
+                    }
 
                     destWriter.WriteLine(minItem.FileData.ToString());
 
@@ -192,12 +234,13 @@ namespace DataSorter
 
                     if (line == null)
                     {
+                        progress.Report($"The chunk: {minItem.FileName} depleted.");
                         minItem.StreamReader.Close();
                         File.Delete(minItem.FileName);
                         continue;
                     }
 
-                    var newFileData = FileData.FromString(line!);
+                    var newFileData = FileData.FromString(line);
 
                     queue.Insert(new FileDataReaderItem(newFileData, minItem.StreamReader, minItem.FileName));
                 }
@@ -219,9 +262,12 @@ namespace DataSorter
         /// </summary>
         /// <param name="console">Console</param>
         /// <param name="timeSpan">Elapsed time.</param>
-        private static void UpdateStatus(IStandardOut console, TimeSpan timeSpan)
+        /// <param name="value"></param>
+        private static void UpdateStatus(IStandardOut console, TimeSpan timeSpan, string value)
         {
-            console.Out.Write($"\rPassed: {timeSpan:c}");
+            console.Out.Write($"\r{new string(' ', 80)}");
+            var str = $"Passed: {timeSpan:c} {value}";
+            console.Out.Write($"\r{str, 80}");
         }
     }
 }
