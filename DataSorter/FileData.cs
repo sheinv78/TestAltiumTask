@@ -4,35 +4,40 @@ using System.Text;
 
 namespace DataSorter
 {
-    internal class FileData : IComparable<FileData>
+    public record FileData : IComparable<FileData>
     {
+        private const string Delimiter = ". ";
+
         private FileData()
         {
-            NumericPart = 0;
+            NumericPart = "0";
             StringPart = string.Empty;
         }
 
         // ReSharper disable once MemberCanBePrivate.Global
         // ReSharper disable once PropertyCanBeMadeInitOnly.Global
-        public uint NumericPart { get; set; }
+        public string NumericPart { get; init; }
 
         // ReSharper disable once MemberCanBePrivate.Global
         // ReSharper disable once PropertyCanBeMadeInitOnly.Global
-        public string StringPart { get; set; }
+        public string StringPart { get; init; }
 
-        public static FileData FromString(string str)
+        public static FileData? FromString(string str)
         {
-            var parts = str.Split(". ");
+            var span = str.AsSpan();
 
-            if (parts.Length != 2)
-            {
-                throw new InvalidOperationException($"The string {str} couldn't be parsed into FileData instance.");
-            }
+            var delimiterIdx = span.IndexOf(Delimiter);
+
+            if (delimiterIdx == -1)
+                throw new IndexOutOfRangeException("The delimiter was not found");
+
+            var numericPart = span[..(delimiterIdx)].Trim();
+            var stringPart = span[(delimiterIdx + 1)..].Trim();
 
             return new FileData()
             {
-                NumericPart = uint.Parse(parts[0]),
-                StringPart = parts[1]
+                NumericPart = numericPart.ToString(),
+                StringPart = stringPart.ToString()
             };
         }
 
@@ -43,7 +48,9 @@ namespace DataSorter
 
             var stringCmpResult = string.Compare(StringPart, other.StringPart, StringComparison.Ordinal);
 
-            return stringCmpResult != 0 ? stringCmpResult : NumericPart.CompareTo(other.NumericPart);
+            return stringCmpResult != 0
+                ? stringCmpResult
+                : string.Compare(NumericPart, other.NumericPart, StringComparison.Ordinal);
         }
 
         public override string ToString()

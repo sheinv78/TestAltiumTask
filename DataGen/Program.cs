@@ -4,7 +4,6 @@ using System.CommandLine.Invocation;
 using System.CommandLine.IO;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Bogus;
@@ -25,7 +24,7 @@ namespace DataGen
                     description: "File to write data to."),
                 new Option<ulong>(
                     "--count",
-                    ()=>100000000UL,
+                    ()=>10000000UL,
                     "Number of the lines to write."),
                 new Option<uint>(
                     "--lowerBound",
@@ -33,7 +32,7 @@ namespace DataGen
                     "Lower bound of the range of the numeric part."),
                 new Option<uint>(
                     "--upperBound",
-                    ()=>1005,
+                    ()=>9999,
                     "Upper bound of the range of the numeric part."),
                 new Option<int>(
                     "--minWords",
@@ -41,7 +40,7 @@ namespace DataGen
                     "Minimum number of words in the string part."),
                 new Option<int>(
                     "--maxWords",
-                    ()=>2,
+                    ()=>20,
                     "Maximum number of words in the string part.")
             };
 
@@ -50,9 +49,9 @@ namespace DataGen
             var completionPercent = -1;
 
             // Note that the parameters of the handler method are matched according to the names of the options
-            rootCommand.Handler = CommandHandler.Create(async (string fileName, ulong count, uint lowerBound, uint upperBound, int minWords, int maxWords, IConsole console, CancellationToken ctoken) =>
+            rootCommand.Handler = CommandHandler.Create(async (string fileName, ulong count, uint lowerBound, uint upperBound, int minWords, int maxWords, IConsole console, CancellationToken cToken) =>
             {
-                ctoken.Register(() =>
+                cToken.Register(() =>
                 {
                     console.Error.WriteLine();
                     console.Error.WriteLine("Operation was cancelled");
@@ -69,7 +68,9 @@ namespace DataGen
                         completionPercent = newCompletionPercent;
                     });
 
-                await GenerateFile(fileName, count, lowerBound, upperBound, minWords, maxWords, ctoken, progress);
+                await GenerateFile(fileName, count, lowerBound, upperBound, minWords, maxWords, cToken, progress);
+
+                UpdateStatus(console, 100);
             });
 
             var watch = System.Diagnostics.Stopwatch.StartNew();
@@ -103,33 +104,29 @@ namespace DataGen
         /// <param name="minWords">Minimum words in string part.</param>
         /// <param name="maxWords">Maximum words in string part.</param>
         /// <param name="token">Cancellation token.</param>
-        /// <param name="progress">Progresser to notify to.</param>
+        /// <param name="reporter">Reporter to notify to.</param>
         /// <returns>Task.</returns>
         [SuppressMessage("ReSharper.DPA", "DPA0002: Excessive memory allocations in SOH")]
-        private static async Task GenerateFile(string fileName, ulong count, uint lowerBound, uint upperBound, int minWords, int maxWords, CancellationToken token, IProgress<ulong> progress)
+        private static async Task GenerateFile(string fileName, ulong count, uint lowerBound, uint upperBound, int minWords, int maxWords, CancellationToken token, IProgress<ulong> reporter)
         {
+            var dirName = Path.GetDirectoryName(fileName) ?? throw new InvalidOperationException();
+
+            Directory.CreateDirectory(dirName);
+
             await using var file = File.CreateText(fileName);
 
             Randomizer.Seed = new Random((int) DateTime.Now.Ticks);
-
-            var sb = new StringBuilder(Environment.SystemPageSize);
 
             var faker = new Faker("en_US");
 
             for (var i = 0UL; i < count; i++)
             {
-                if (token.IsCancellationRequested)
-                {
-                    return;
-                }
+                token.ThrowIfCancellationRequested();
 
-                sb.AppendJoin(". ", faker.Random.UInt(lowerBound, upperBound),
-                    faker.Lorem.Sentence(minWords, maxWords - minWords));
+                var line = $"{faker.Random.UInt(lowerBound, upperBound)}. {faker.Lorem.Sentence(minWords, maxWords - minWords)}";
 
-                await file.WriteLineAsync(sb.ToString());
-                progress.Report(i);
-
-                sb.Clear();
+                await file.WriteLineAsync(line);
+                reporter.Report(i);
             }
         }
     }

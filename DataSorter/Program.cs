@@ -8,13 +8,14 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using MoreComplexDataStructures;
 
 namespace DataSorter
 {
     internal static class Program
     {
-        private static async Task<int> Main(string[] args)
+        private record DataItem(FileData? Item, FileDataReader StreamReader, string FileName);
+
+        private static async Task Main(string[] args)
         {
             var rootCommand = new RootCommand
             {
@@ -24,9 +25,9 @@ namespace DataSorter
                 new Argument<string>(
                     "destfile-name",
                     description: "File to sort to."),
-                new Option<ulong>(
+                new Option<int>(
                     "--chunk-size",
-                    () => 0x100000U,
+                    () => 1_000_000,
                     "Average chunk size in records"),
             };
 
@@ -34,226 +35,197 @@ namespace DataSorter
 
             var watch = System.Diagnostics.Stopwatch.StartNew();
 
-            var prevTime = new TimeSpan();
-
             // Note that the parameters of the handler method are matched according to the names of the options
             rootCommand.Handler = CommandHandler.Create(
-                async (string sourcefileName, string destFileName, ulong chunkSize,
-                    IConsole console, CancellationToken ctoken) =>
+                async (string sourcefileName, string destFileName, int chunkSize,
+                    IConsole console, CancellationToken cToken) =>
                 {
-                    ctoken.Register(() =>
+                    cToken.Register(() =>
                     {
                         console.Error.WriteLine();
                         console.Error.WriteLine("Operation was cancelled");
                     });
 
                     var progress = new Progress<string>(
-                        value =>
-                        {
-                            if ((watch.Elapsed - prevTime).TotalSeconds < 1) return;
+                        value => { UpdateStatus(console, value); });
 
-                            prevTime = watch.Elapsed;
-
-                            UpdateStatus(console, prevTime, value);
-                        });
-
-                    await SortFile(sourcefileName, destFileName, chunkSize, console, ctoken, progress);
+                    await SortFile(sourcefileName, destFileName, chunkSize, console, cToken, progress);
                 });
 
             // Parse the incoming args and invoke the handler
-            var result = await rootCommand.InvokeAsync(args);
-            watch.Stop();
+            var cmdTask = rootCommand.InvokeAsync(args);
 
-            Console.WriteLine();
-            Console.Write($"Total execution time: {watch.Elapsed:c}");
+            cmdTask.GetAwaiter().OnCompleted(() =>
+            {
+                watch.Stop();
 
-            return result;
+                Console.WriteLine();
+                Console.Write($"Total execution time: {watch.Elapsed:c}");
+            });
+
+            await cmdTask;
         }
 
         /// <summary>
         ///     Sort file.
         /// </summary>
-        /// <param name="sourcefileName">Source file name.</param>
+        /// <param name="sourceFileName">Source file name.</param>
         /// <param name="destFileName">Destination file name.</param>
         /// <param name="chunkSize">The size of single chunk.</param>
         /// <param name="console">Console.</param>
-        /// <param name="ctoken">Cancellation tocken.</param>
+        /// <param name="cToken">Cancellation token.</param>
         /// <param name="progress">Progress to report to the user.</param>
         /// <returns>Task.</returns>
-        private static Task SortFile(string sourcefileName, string destFileName, ulong chunkSize,
+        private static async Task SortFile(string sourceFileName, string destFileName, int chunkSize,
             IStandardOut console,
-            CancellationToken ctoken,
+            CancellationToken cToken,
             IProgress<string> progress)
         {
-            return Task.Run(() =>
+            try
             {
-                console.Out.WriteLine("Splitting...");
+                using var srcReader = DataFile.OpenFileDataReader(sourceFileName);
 
-                var sourceFileInfo = new FileInfo(sourcefileName);
-
-                // ReSharper disable once PossibleLossOfFraction
-                var countOfFiles = Math.Ceiling((decimal)(sourceFileInfo.Length / (long)chunkSize));
-
-                console.Out.WriteLine($"Estimated split into {countOfFiles} files");
+                progress.Report("Splitting into chunks...");
 
                 // Step1: Split input file into chunks of size ChunkSize.
-                var fileNames = Split(sourcefileName, chunkSize, progress);
+                var files = await SplitFile(srcReader, chunkSize, @"C:\Temp", cToken, progress);
 
-                var fileList = fileNames.ToList();
-                foreach (var fileName in fileList)
-                {
-                    console.Out.WriteLine(fileName);
-                }
+                await using var dstWriter = DataFile.OpenFileDataWriter(destFileName);
 
                 // Step2: Merging chunks
-                KWayMerge(fileList, destFileName, progress);
+                await KWayMerge(files, dstWriter, cToken, progress);
 
-                foreach (var fileName in fileList)
-                {
-                    File.Delete(fileName);
-                    console.Out.WriteLine($"{fileName} deleted.");
-                }
-
-                console.Out.WriteLine($"Dest file: {destFileName}");
-            }, ctoken);
+                progress.Report($"Dest file: {destFileName}");
+            }
+            catch (Exception e)
+            {
+                progress.Report(e.Message);
+            }
         }
+
+        // private static void Cleanup(IEnumerable<string> fileNames)
+        // {
+        //     Parallel.ForEach(fileNames, File.Delete);
+        // }
 
         /// <summary>
         ///     Split source file into a set of sorted chunks.
         /// </summary>
-        /// <param name="sourcefileName">The name of source file.</param>
-        /// <param name="chunkSize">The size of single file.</param>
+        /// <param name="reader"></param>
+        /// <param name="chunkSize"></param>
+        /// <param name="cToken"></param>
         /// <param name="progress"></param>
+        /// <param name="path"></param>
         /// <returns>The list of file names containing presorted chunks.</returns>
-        private static IEnumerable<string> Split(string sourcefileName, ulong chunkSize, IProgress<string> progress)
+        private static async Task<List<string>> SplitFile(FileDataReader reader, int chunkSize, string path,
+            CancellationToken cToken, IProgress<string> progress)
         {
-            static string WriteSortedData(List<FileData> list, IProgress<string> progress)
+            var result = new List<string>();
+
+            progress.Report("Splitting started");
+
+            var list = new List<FileData>(chunkSize);
+
+            while (!reader.EndOfStream)
             {
-                list.Sort();
-
-                var fileName = Path.GetTempFileName();
-
-                progress.Report($"Start unloading the chunk into {fileName}");
-
-                using var fileWriter = File.CreateText(fileName);
-
-                foreach (var data in list)
+                progress.Report("Preparing next chunk.");
+                while (list.Count < list.Capacity)
                 {
-                    fileWriter.WriteLine(data.ToString());
+                    cToken.ThrowIfCancellationRequested();
+
+                    var item = await reader.ReadFileDataItemAsync();
+
+                    if (item is not null)
+                    {
+                        list.Add(item);
+                    }
+                    else
+                        break;
                 }
 
-                progress.Report($"Unloading the chunk into {fileName} completed");
+                var sortedData = list.OrderBy(x => x.StringPart);
 
-                fileWriter.Close();
+                var fileName = Path.Combine(path, Path.GetRandomFileName());
+                result.Add(fileName);
+
+                await using var fileWriter =
+                    DataFile.CreateFileDataWriter(fileName);
+
+                await fileWriter.WriteFileDataAsync(sortedData);
+
+                progress.Report($"{fileName} finished");
+
                 list.Clear();
-                return fileName;
             }
 
-            var tempFileNames = new List<string>();
-
-            using var srcReader = File.OpenText(sourcefileName);
-
-            var chunk = new List<FileData>((int) chunkSize);
-
-            while (!srcReader.EndOfStream)
-            {
-                var line = srcReader.ReadLine();
-
-                if (line == null)
-                    break;
-
-                var fileData = FileData.FromString(line);
-
-                if (chunk.Count < chunk.Capacity)
-                {
-                    chunk.Add(fileData);
-                }
-                else
-                {
-                    var tempfileName = WriteSortedData(chunk, progress);
-                    tempFileNames.Add(tempfileName);
-                }
-            }
-
-            if (chunk.Count == 0) return tempFileNames;
-
-            var fileName = WriteSortedData(chunk, progress);
-            tempFileNames.Add(fileName);
-
-            return tempFileNames;
+            return result;
         }
 
         /// <summary>
         ///     Perform K-way merge.
         /// </summary>
+        /// <param name="files"></param>
+        /// <param name="writer"></param>
+        /// <param name="cancellationToken"></param>
+        /// <param name="progress"></param>
         /// <param name="fileNames">Source file names.</param>
         /// <param name="destFileName">Destination file name.</param>
-        /// <param name="progress"></param>
-        private static void KWayMerge(IEnumerable<string> fileNames, string destFileName, IProgress<string> progress)
+        private static async Task KWayMerge(IEnumerable<string> files, FileDataWriter writer,
+            CancellationToken cancellationToken,
+            IProgress<string> progress)
         {
-            using var destWriter = File.CreateText(destFileName);
-
-            var streamReaders = new List<(StreamReader,string)>();
+            List<FileDataReader>? dataReaders = null;
 
             try
             {
-                progress.Report($"Initial fillup of minheap.");
+                dataReaders = files.Select(DataFile.OpenFileDataReader).ToList();
 
-                streamReaders.AddRange(fileNames.Select(x=>(File.OpenText(x),x)));
+                progress.Report($"Initial fill up of minheap.");
 
-                var queue = new MinHeap<FileDataReaderItem>();
+                var queue = new PriorityQueue<DataItem, FileData>();
 
-                foreach (var (reader, fileName) in streamReaders)
+                foreach (var dataReader in dataReaders)
                 {
-                    var line = reader.ReadLine();
-                    if (line == null)
-                        continue;
+                    var fileData = await dataReader.ReadFileDataItemAsync()!;
 
-                    var fileData = FileData.FromString(line);
-
-                    queue.Insert(new FileDataReaderItem(fileData, reader, fileName));
+                    if (fileData != null)
+                        queue.Enqueue(new DataItem(fileData, dataReader, dataReader.FileName), fileData);
                 }
 
                 progress.Report($"Start k-way merge.");
 
-                while (true)
+                while (queue.Count > 0)
                 {
-                    if (queue.Count == 0) break;
+                    cancellationToken.ThrowIfCancellationRequested();
 
-                    var minItem = queue.ExtractMin();
+                    var (item, streamReader, fileName) = queue.Dequeue();
 
-                    if (minItem == null)
+                    await writer.WriteFileDataAsync(item);
+
+                    var newItem = await streamReader.ReadFileDataItemAsync();
+
+                    if (newItem is null)
                     {
-                        progress.Report("Sucessfully completed.");
-                        break;
+                        progress.Report($"The chunk: {fileName} depleted.");
+                        streamReader.Close();
+                        dataReaders.Remove(streamReader);
+                        File.Delete(fileName);
                     }
-
-                    destWriter.WriteLine(minItem.FileData.ToString());
-
-                    var line = minItem.StreamReader.ReadLine();
-
-                    if (line == null)
+                    else
                     {
-                        progress.Report($"The chunk: {minItem.FileName} depleted.");
-                        minItem.StreamReader.Close();
-                        File.Delete(minItem.FileName);
-                        continue;
+                        queue.Enqueue(new DataItem(newItem, streamReader, fileName), newItem);
                     }
-
-                    var newFileData = FileData.FromString(line);
-
-                    queue.Insert(new FileDataReaderItem(newFileData, minItem.StreamReader, minItem.FileName));
                 }
+
+                progress.Report("Successfully completed.");
             }
             finally
             {
-                foreach (var (reader, fileName) in streamReaders)
-                {
-                    reader.Close();
-
-                    if (File.Exists(fileName))
-                        File.Delete(fileName);
-                }
+                if (dataReaders != null)
+                    foreach (var reader in dataReaders)
+                    {
+                        reader.Dispose();
+                    }
             }
         }
 
@@ -261,13 +233,10 @@ namespace DataSorter
         ///     Update status.
         /// </summary>
         /// <param name="console">Console</param>
-        /// <param name="timeSpan">Elapsed time.</param>
         /// <param name="value"></param>
-        private static void UpdateStatus(IStandardOut console, TimeSpan timeSpan, string value)
+        private static void UpdateStatus(IStandardOut console, string value)
         {
-            console.Out.Write($"\r{new string(' ', 80)}");
-            var str = $"Passed: {timeSpan:c} {value}";
-            console.Out.Write($"\r{str, 80}");
+            console.Out.WriteLine(value);
         }
     }
 }
