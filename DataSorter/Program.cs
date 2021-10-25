@@ -13,7 +13,7 @@ namespace DataSorter
 {
     internal static class Program
     {
-        private record DataItem(FileData? Item, FileDataReader StreamReader, string FileName);
+        private record DataItem(FileData? Item, FileDataReader StreamReader);
 
         private static async Task Main(string[] args)
         {
@@ -49,7 +49,7 @@ namespace DataSorter
                     var progress = new Progress<string>(
                         value => { UpdateStatus(console, value); });
 
-                    await SortFile(sourcefileName, destFileName, chunkSize, console, cToken, progress);
+                    await SortFile(sourcefileName, destFileName, chunkSize, cToken, progress);
                 });
 
             // Parse the incoming args and invoke the handler
@@ -72,12 +72,10 @@ namespace DataSorter
         /// <param name="sourceFileName">Source file name.</param>
         /// <param name="destFileName">Destination file name.</param>
         /// <param name="chunkSize">The size of single chunk.</param>
-        /// <param name="console">Console.</param>
         /// <param name="cToken">Cancellation token.</param>
         /// <param name="progress">Progress to report to the user.</param>
         /// <returns>Task.</returns>
         private static async Task SortFile(string sourceFileName, string destFileName, int chunkSize,
-            IStandardOut console,
             CancellationToken cToken,
             IProgress<string> progress)
         {
@@ -122,40 +120,55 @@ namespace DataSorter
         {
             var result = new List<string>();
 
-            progress.Report("Splitting started");
-
-            var list = new List<FileData>(chunkSize);
-
-            while (!reader.EndOfStream)
+            try
             {
-                progress.Report("Preparing next chunk.");
-                while (list.Count < list.Capacity)
+                progress.Report("Splitting started");
+
+                var list = new List<FileData>(chunkSize);
+
+                while (!reader.EndOfStream)
                 {
-                    cToken.ThrowIfCancellationRequested();
-
-                    var item = await reader.ReadFileDataItemAsync();
-
-                    if (item is not null)
+                    progress.Report("Preparing next chunk.");
+                    while (list.Count < list.Capacity)
                     {
-                        list.Add(item);
+                        cToken.ThrowIfCancellationRequested();
+
+                        var item = await reader.ReadFileDataItemAsync();
+
+                        if (item is not null)
+                        {
+                            list.Add(item);
+                        }
+                        else
+                            break;
                     }
-                    else
-                        break;
+
+                    var sortedData = list.OrderBy(x => x.StringPart);
+
+                    var fileName = Path.Combine(path, Path.GetRandomFileName());
+                    result.Add(fileName);
+
+                    await using var fileWriter =
+                        DataFile.CreateFileDataWriter(fileName);
+
+                    await fileWriter.WriteFileDataAsync(sortedData);
+
+                    progress.Report($"{fileName} finished");
+
+                    list.Clear();
+                }
+            }
+            catch (Exception)
+            {
+                foreach (var fileName in result.Where(File.Exists))
+                {
+                    File.Delete(fileName);
+                    progress.Report($"{reader.FileName} was deleted");
                 }
 
-                var sortedData = list.OrderBy(x => x.StringPart);
+                result.Clear();
 
-                var fileName = Path.Combine(path, Path.GetRandomFileName());
-                result.Add(fileName);
-
-                await using var fileWriter =
-                    DataFile.CreateFileDataWriter(fileName);
-
-                await fileWriter.WriteFileDataAsync(sortedData);
-
-                progress.Report($"{fileName} finished");
-
-                list.Clear();
+                throw;
             }
 
             return result;
@@ -168,8 +181,6 @@ namespace DataSorter
         /// <param name="writer"></param>
         /// <param name="cancellationToken"></param>
         /// <param name="progress"></param>
-        /// <param name="fileNames">Source file names.</param>
-        /// <param name="destFileName">Destination file name.</param>
         private static async Task KWayMerge(IEnumerable<string> files, FileDataWriter writer,
             CancellationToken cancellationToken,
             IProgress<string> progress)
@@ -186,10 +197,12 @@ namespace DataSorter
 
                 foreach (var dataReader in dataReaders)
                 {
-                    var fileData = await dataReader.ReadFileDataItemAsync()!;
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    var fileData = await dataReader.ReadFileDataItemAsync();
 
                     if (fileData != null)
-                        queue.Enqueue(new DataItem(fileData, dataReader, dataReader.FileName), fileData);
+                        queue.Enqueue(new DataItem(fileData, dataReader), fileData);
                 }
 
                 progress.Report($"Start k-way merge.");
@@ -198,7 +211,7 @@ namespace DataSorter
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
-                    var (item, streamReader, fileName) = queue.Dequeue();
+                    var (item, streamReader) = queue.Dequeue();
 
                     await writer.WriteFileDataAsync(item);
 
@@ -206,14 +219,14 @@ namespace DataSorter
 
                     if (newItem is null)
                     {
-                        progress.Report($"The chunk: {fileName} depleted.");
+                        progress.Report($"The chunk: {streamReader.FileName} depleted.");
                         streamReader.Close();
                         dataReaders.Remove(streamReader);
-                        File.Delete(fileName);
+                        File.Delete(streamReader.FileName);
                     }
                     else
                     {
-                        queue.Enqueue(new DataItem(newItem, streamReader, fileName), newItem);
+                        queue.Enqueue(new DataItem(newItem, streamReader), newItem);
                     }
                 }
 
@@ -224,7 +237,10 @@ namespace DataSorter
                 if (dataReaders != null)
                     foreach (var reader in dataReaders)
                     {
-                        reader.Dispose();
+                        reader.Close();
+                        if (!File.Exists(reader.FileName)) continue;
+                        File.Delete(reader.FileName);
+                        progress.Report($"{reader.FileName} was deleted");
                     }
             }
         }
